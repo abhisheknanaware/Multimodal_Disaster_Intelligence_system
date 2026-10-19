@@ -77,10 +77,12 @@ def process_weather_data(data: dict) -> dict:
     hourly_soil = data["hourly"].get("soil_moisture_0_to_7cm", [])
     
     times = [parser.parse(t) for t in hourly_time]
-    
-    current_index = 31 * 24
-    if current_index >= len(times):
-        current_index = len(times) - (4 * 24)
+
+    # Hourly times are local to the location; split past/forecast at the current local hour
+    local_now = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=data.get("utc_offset_seconds", 0))
+    current_index = sum(1 for t in times if t <= local_now)
+    if current_index == 0 or current_index >= len(times):
+        current_index = min(31 * 24, len(times) - 1)
         
     past_precip = hourly_precip[:current_index]
     forecast_precip = hourly_precip[current_index:]
@@ -101,8 +103,8 @@ def process_weather_data(data: dict) -> dict:
         
     # Extract current soil moisture
     current_soil_moisture = None
-    if current_index < len(hourly_soil):
-        current_soil_moisture = hourly_soil[current_index]
+    if 0 < current_index <= len(hourly_soil):
+        current_soil_moisture = hourly_soil[current_index - 1]
 
     metrics = {
         "rainfall": {

@@ -1,0 +1,278 @@
+{
+  "landslide": {
+    "config": {
+      "depth": 5,
+      "l2_leaf_reg": 10,
+      "learning_rate": 0.05,
+      "iterations": 500
+    },
+    "n": 2753,
+    "spatial_cv": {
+      "roc_auc": 0.8452,
+      "pr_auc": 0.6656,
+      "threshold": 0.25,
+      "macro_f1": 0.7287,
+      "precision": 0.5565,
+      "recall": 0.7034,
+      "f1_pos": 0.6214,
+      "confusion": {
+        "tn": 1606,
+        "fp": 412,
+        "fn": 218,
+        "tp": 517
+      }
+    },
+    "spatial_cv_hard_negatives_only": {
+      "roc_auc": 0.7879,
+      "pr_auc": 0.7087,
+      "threshold": 0.25,
+      "macro_f1": 0.7061,
+      "precision": 0.609,
+      "recall": 0.7034,
+      "f1_pos": 0.6528,
+      "confusion": {
+        "tn": 868,
+        "fp": 332,
+        "fn": 218,
+        "tp": 517
+      }
+    },
+    "old_v4_same_points": {
+      "roc_auc": 0.7121,
+      "pr_auc": 0.4287,
+      "threshold": 0.6,
+      "macro_f1": 0.6333,
+      "precision": 0.4493,
+      "recall": 0.5007,
+      "f1_pos": 0.4736,
+      "confusion": {
+        "tn": 1567,
+        "fp": 451,
+        "fn": 367,
+        "tp": 368
+      }
+    },
+    "old_v4_hard_negatives_only": {
+      "roc_auc": 0.5801,
+      "pr_auc": 0.4574,
+      "threshold": 0.6,
+      "macro_f1": 0.5815,
+      "precision": 0.4773,
+      "recall": 0.5007,
+      "f1_pos": 0.4887,
+      "confusion": {
+        "tn": 797,
+        "fp": 403,
+        "fn": 367,
+        "tp": 368
+      }
+    },
+    "deploy_threshold": 0.25,
+    "features": [
+      "elevation",
+      "slope",
+      "northness",
+      "eastness",
+      "tri",
+      "tpi",
+      "slope_mean_500m",
+      "slope_max_500m",
+      "slope_std_500m",
+      "relief_500m",
+      "relief_1500m",
+      "rel_elev_1500m",
+      "curvature_proxy",
+      "slope_mean_1500m",
+      "relief_5km",
+      "elev_std_1500m",
+      "rain_clim_jjas",
+      "heavy_rain_days"
+    ],
+    "feature_importance": {
+      "rain_clim_jjas": 9.865020123101791,
+      "relief_5km": 9.79569568160838,
+      "elevation": 9.465935099410263,
+      "heavy_rain_days": 9.310874305182168,
+      "slope_max_500m": 8.17775172845759,
+      "slope_std_500m": 6.849723537520278,
+      "slope_mean_1500m": 5.64403430472217,
+      "rel_elev_1500m": 5.471139726071827,
+      "slope": 5.17050048408744,
+      "slope_mean_500m": 4.554672729462272,
+      "elev_std_1500m": 4.408125156281936,
+      "tri": 4.404475835133594,
+      "curvature_proxy": 3.6570233955428515,
+      "tpi": 2.9691026215538647,
+      "relief_1500m": 2.8838293291852657,
+      "northness": 2.868198335652767,
+      "relief_500m": 2.408512249053999,
+      "eastness": 2.0953853579715567
+    }
+  },
+  "flood": {
+    "config": {
+      "depth": 6,
+      "l2_leaf_reg": 5,
+      "learning_rate": 0.03,
+      "iterations": 800,
+      "monotone_constraints": {
+        "rain_clim_jjas": 1,
+        "rain_1d": 1,
+        "rain_3d": 1,
+        "rain_7d": 1,
+        "rain_14d": 1,
+        "rain_30d": 1,
+        "soil_moisture": 1
+      }
+    },
+    "n_labelled": 702,
+    "n_dry_season_aug": 458,
+    "spatial_cv": {
+      "roc_auc": 0.888,
+      "pr_auc": 0.8245,
+      "threshold": 0.24,
+      "macro_f1": 0.8132,
+      "precision": 0.7256,
+      "recall": 0.9106,
+      "f1_pos": 0.8076,
+      "confusion": {
+        "tn": 296,
+        "fp": 104,
+        "fn": 27,
+        "tp": 275
+      }
+    },
+    "dry_season_false_alarm_rate": 0.0,
+    "leave_one_date_out_cv": {
+      "roc_auc": 0.8687,
+      "pr_auc": 0.7872,
+      "threshold": 0.2,
+      "macro_f1": 0.8031,
+      "precision": 0.7193,
+      "recall": 0.8907,
+      "f1_pos": 0.7959,
+      "confusion": {
+        "tn": 295,
+        "fp": 105,
+        "fn": 33,
+        "tp": 269
+      }
+    },
+    "ablation_terrain_only_spatial_cv": {
+      "roc_auc": 0.8809,
+      "pr_auc": 0.7891,
+      "threshold": 0.1,
+      "macro_f1": 0.8161,
+      "precision": 0.727,
+      "recall": 0.9172,
+      "f1_pos": 0.8111,
+      "confusion": {
+        "tn": 296,
+        "fp": 104,
+        "fn": 25,
+        "tp": 277
+      }
+    },
+    "old_v3_features_spatial_cv": {
+      "roc_auc": 0.9478,
+      "pr_auc": 0.931,
+      "threshold": 0.36,
+      "macro_f1": 0.854,
+      "precision": 0.7841,
+      "recall": 0.9139,
+      "f1_pos": 0.844,
+      "confusion": {
+        "tn": 324,
+        "fp": 76,
+        "fn": 26,
+        "tp": 276
+      }
+    },
+    "old_v3_features_no_s1_spatial_cv": {
+      "roc_auc": 0.8908,
+      "pr_auc": 0.8317,
+      "threshold": 0.31,
+      "macro_f1": 0.807,
+      "precision": 0.7326,
+      "recall": 0.8709,
+      "f1_pos": 0.7958,
+      "confusion": {
+        "tn": 304,
+        "fp": 96,
+        "fn": 39,
+        "tp": 263
+      }
+    },
+    "old_v3_in_sample": {
+      "roc_auc": 1.0,
+      "pr_auc": 1.0,
+      "threshold": 0.5,
+      "macro_f1": 0.9826,
+      "precision": 0.9618,
+      "recall": 1.0,
+      "f1_pos": 0.9805,
+      "confusion": {
+        "tn": 388,
+        "fp": 12,
+        "fn": 0,
+        "tp": 302
+      }
+    },
+    "old_v3_as_served_live": {
+      "roc_auc": 0.9934,
+      "pr_auc": 0.9916,
+      "threshold": 0.5,
+      "macro_f1": 0.9481,
+      "precision": 0.908,
+      "recall": 0.9801,
+      "f1_pos": 0.9427,
+      "confusion": {
+        "tn": 370,
+        "fp": 30,
+        "fn": 6,
+        "tp": 296
+      }
+    },
+    "deploy_threshold": 0.24000000000000002,
+    "features": [
+      "elevation",
+      "slope",
+      "relief_1500m",
+      "rel_elev_1500m",
+      "rel_elev_5km",
+      "elev_pct_5km",
+      "low_flat_frac_1500m",
+      "slope_mean_1500m",
+      "elev_std_1500m",
+      "rain_clim_jjas",
+      "heavy_rain_days",
+      "rain_1d",
+      "rain_3d",
+      "rain_7d",
+      "rain_14d",
+      "rain_30d",
+      "rain_3d_share_14d",
+      "soil_moisture"
+    ],
+    "feature_importance": {
+      "rain_30d": 21.987896939043626,
+      "rain_3d_share_14d": 8.729466361320844,
+      "slope": 7.987004911768893,
+      "rain_14d": 7.115415007437586,
+      "elevation": 5.58909120265675,
+      "elev_pct_5km": 5.443230693264311,
+      "rel_elev_1500m": 5.415613197244956,
+      "rel_elev_5km": 5.335877916702815,
+      "relief_1500m": 5.023227993481512,
+      "heavy_rain_days": 4.5856648805885225,
+      "low_flat_frac_1500m": 4.383828386311205,
+      "rain_3d": 4.3579609283332275,
+      "rain_1d": 3.500550147833559,
+      "rain_7d": 3.3943795648634794,
+      "elev_std_1500m": 3.3207312120670105,
+      "slope_mean_1500m": 2.9911654202051654,
+      "rain_clim_jjas": 0.4490519988452045,
+      "soil_moisture": 0.38984323803136456
+    }
+  }
+}

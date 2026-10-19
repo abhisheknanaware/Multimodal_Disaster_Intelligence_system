@@ -1,120 +1,91 @@
 import os
-import joblib
-import pandas as pd
+import json
+import logging
+from datetime import datetime
+from functools import lru_cache
+
 import numpy as np
+import pandas as pd
+import rasterio
 import catboost
+from catboost import Pool
 
-# Load the previously trained V4 Advanced model
+import feature_builder as fb
+from weather_service import fetch_weather_data
+
+logger = logging.getLogger(__name__)
+
+workspace = os.environ.get("PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(workspace, "models", "v5"))
+
+
+def _load(name):
+    path = os.path.join(MODEL_DIR, name)
+    if not os.path.exists(path):
+        logger.error(f"Model not found: {path}")
+        return None
+    model = catboost.CatBoostClassifier()
+    model.load_model(path)
+    return model
+
+
+landslide_model = _load("landslide_v5.cbm")
+flood_model = _load("flood_v5.cbm")
+
 try:
-    workspace = os.environ.get("PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    ls_cb_model_path = os.path.join(workspace, "models", "landslide_v4_advanced.cbm")
-    if os.path.exists(ls_cb_model_path):
-        landslide_cb_model = catboost.CatBoostRegressor()
-        landslide_cb_model.load_model(ls_cb_model_path)
-        ls_cb_feature_names = landslide_cb_model.feature_names_
-    else:
-        landslide_cb_model = None
-        ls_cb_feature_names = []
-except Exception as e:
-    print(f"Error loading v4 model: {e}")
-    landslide_cb_model = None
-    ls_cb_feature_names = []
+    with open(os.path.join(MODEL_DIR, "metrics_v5.json")) as f:
+        _metrics = json.load(f)
+except Exception:
+    _metrics = {}
+LANDSLIDE_THRESHOLD = _metrics.get("landslide", {}).get("deploy_threshold", 0.5)
+FLOOD_THRESHOLD = _metrics.get("flood", {}).get("deploy_threshold", 0.5)
 
-# Load the flood classifier once at startup (override with FLOOD_MODEL_PATH)
-try:
-    flood_model_path = os.environ.get("FLOOD_MODEL_PATH", os.path.join(workspace, "models", "flood_catboost_v3.cbm"))
-    if os.path.exists(flood_model_path):
-        flood_cb_model = catboost.CatBoostClassifier()
-        flood_cb_model.load_model(flood_model_path)
-    else:
-        print(f"Flood model not found at {flood_model_path}")
-        flood_cb_model = None
-except Exception as e:
-    print(f"Error loading flood model: {e}")
-    flood_cb_model = None
 
-def calculate_dynamic_risk(terrain_data: dict, rainfall: dict, forecast: dict, s2_data: dict = None) -> dict:
+@lru_cache(maxsize=4096)
+def _terrain(lat_r: float, lon_r: float) -> dict:
+    return fb.terrain_features(lat_r, lon_r)
+
+
+def terrain_at(lat: float, lon: float) -> dict:
+    """Static terrain features, cached per ~10 m cell."""
+    return _terrain(round(lat, 4), round(lon, 4))
+
+
+def _predict(model, features: list, values: dict):
+    row = pd.DataFrame([[values.get(f, np.nan) for f in features]], columns=features).astype(float)
+    prob = float(model.predict_proba(row)[0][1])
+    shap = model.get_feature_importance(Pool(row), type='ShapValues')[0][:-1]
+    local = {f: round(float(v), 4) for f, v in zip(features, shap)}
+    global_fi = {f: round(float(v), 3) for f, v in zip(features, model.get_feature_importance())}
+    return prob, local, global_fi
+
+
+def calculate_dynamic_risk(lat: float, lon: float, rainfall: dict) -> dict:
     """
-    Calculates dynamic landslide risk using the Sentinel-1 + Terrain model (CatBoost).
-    Returns RAW probabilities without any artificial scaling.
+    Landslide hazard = learned susceptibility (v5 classifier on terrain) x rainfall trigger.
+    `rainfall` holds 24h_mm and 3d_mm ending at the time being predicted, so callers can
+    shift it forward with forecast rain for the 24h / 72h horizons.
     """
-    result = {
-        "probability": 0.0,
-        "localContributions": None,
-        "globalFeatureImportance": None
-    }
-    
-    if landslide_cb_model is None:
+    result = {"probability": 0.0, "susceptibility": None, "rainTrigger": None,
+              "localContributions": None, "globalFeatureImportance": None}
+    if landslide_model is None:
         return result
-        
     try:
-        r24 = forecast.get("24h_mm", 0)
-        
-        # Build the exact 13-feature array expected by the V4 model
-        r24 = forecast.get("24h_mm", 0)
-        
-        slope = terrain_data.get('slope', 0)
-        aspect = terrain_data.get('aspect', 0)
-        tpi = terrain_data.get('tpi', 0)
-        
-        northness = np.cos(np.radians(aspect)) if aspect is not None else 0
-        eastness = np.sin(np.radians(aspect)) if aspect is not None else 0
-        
-        safe_slope = max(0.001, np.radians(slope)) if slope is not None else 0.001
-        twi_proxy = -tpi / np.tan(safe_slope) if tpi is not None else 0
-        erosion_potential = (r24 * np.tan(safe_slope)) if r24 is not None else 0
-        
-        # In V4, 'elevation' maps to 'dem'
-        feature_dict = {
-            'slope': slope if slope is not None else np.nan,
-            'elevation': terrain_data.get('dem') if terrain_data.get('dem') is not None else np.nan,
-            'tpi': tpi if tpi is not None else np.nan,
-            'tri': terrain_data.get('tri') if terrain_data.get('tri') is not None else np.nan,
-            'aspect': aspect if aspect is not None else np.nan,
-            'sar_change': terrain_data.get('sar_change') if terrain_data.get('sar_change') is not None else np.nan,
-            'rainfall': r24 if r24 is not None else np.nan,
-            's2_ndvi': terrain_data.get('s2_ndvi') if terrain_data.get('s2_ndvi') is not None else np.nan,
-            's2_ndwi': terrain_data.get('s2_ndwi') if terrain_data.get('s2_ndwi') is not None else np.nan,
-            'northness': northness,
-            'eastness': eastness,
-            'twi_proxy': twi_proxy,
-            'erosion_potential': erosion_potential
-        }
-        
-        features = []
-        missing_features = []
-        for f_name in ls_cb_feature_names:
-            val = feature_dict.get(f_name)
-            if val is None or np.isnan(val):
-                missing_features.append(f_name)
-                # Let CatBoost handle missing values natively
-                features.append(np.nan)
-            else:
-                features.append(val)
-                    
-        if len(missing_features) > 3:
-            print(f"Warning: Missing features {missing_features}. Prediction might be degraded.")
-            
-        # V4 is a regressor on 0-1 susceptibility; clip to keep it a valid probability
-        prob = float(landslide_cb_model.predict([features])[0])
-        prob = max(0.0, min(1.0, prob))
-        
-        result["probability"] = round(prob, 4)
-        
-        # Feature importances mapping
-        if hasattr(landslide_cb_model, 'get_feature_importance'):
-            importances = landslide_cb_model.get_feature_importance()
-            global_fi = {}
-            for name, imp in zip(ls_cb_feature_names, importances):
-                # Filter out the padded S1 historical dates for the UI clarity
-                if "S1_" not in name or imp > 0:
-                    global_fi[name] = float(imp)
-            result["globalFeatureImportance"] = global_fi
-            
-        return result
+        terrain = terrain_at(lat, lon)
+        susceptibility, local, global_fi = _predict(landslide_model, fb.LANDSLIDE_FEATURES, terrain)
+        trigger = fb.landslide_rain_trigger(rainfall.get("24h_mm", 0), rainfall.get("3d_mm", 0))
+        result.update({
+            "probability": round(susceptibility * trigger, 4),
+            "susceptibility": round(susceptibility, 4),
+            "susceptibleClass": susceptibility >= LANDSLIDE_THRESHOLD,
+            "rainTrigger": trigger,
+            "localContributions": local,
+            "globalFeatureImportance": global_fi,
+        })
     except Exception as e:
-        print(f"Error calculating CatBoost dynamic risk: {e}")
-        return result
+        logger.error(f"Landslide risk failed: {e}")
+    return result
+
 
 def get_risk_class(risk_value: float) -> str:
     """
@@ -137,139 +108,61 @@ def get_risk_class(risk_value: float) -> str:
         return "Very High"
 
 
+def _sentinel1_display(lat: float, lon: float) -> dict:
+    """Latest processed Sentinel-1 backscatter, shown for context only (not a model input)."""
+    s1_dir = os.path.join(workspace, "sentel", "sentinel", "output", "2026")
+    data_dir = os.path.join(s1_dir, "S1A_IW_GRDH_1SDV_20260526T115657_20260526T115722_064688_082639_2896_Orb_Cal_Spk_TC.data")
+    out = {"vv": None, "vh": None, "vvChange": None, "vhChange": None, "ratio": None,
+           "currentDate": "2026-05-26", "previousDate": None}
+    try:
+        for band, key in (("Sigma0_VV.img", "vv"), ("Sigma0_VH.img", "vh")):
+            path = os.path.join(data_dir, band)
+            if os.path.exists(path):
+                with rasterio.open(path) as src:
+                    val = float(next(src.sample([(lon, lat)]))[0])
+                    out[key] = round(val, 4) if val > -999 else None
+        if out["vv"] and out["vh"]:
+            out["ratio"] = round(out["vv"] / out["vh"], 4)
+    except Exception as e:
+        logger.error(f"Error extracting Sentinel-1: {e}")
+    return out
+
+
 async def calculate_flood_risk(lat: float, lon: float):
-    from datetime import datetime
-    import os
-    import rasterio
-    import numpy as np
-    import pandas as pd
-    import joblib
-    from weather_service import fetch_weather_data
-    
-    # 1. Fetch Rainfall from Open-Meteo
-    rainfall_data = None
+    rainfall_data, soil = None, None
     try:
         weather_metrics = await fetch_weather_data(lat, lon)
-        rainfall_data = weather_metrics.get("rainfall", {})
+        if weather_metrics.get("source") != "Fallback":
+            rainfall_data = weather_metrics.get("rainfall", {})
+            soil = (weather_metrics.get("soil_moisture") or {}).get("value")
     except Exception as e:
-        print(f"Error extracting Weather data: {e}")
+        logger.error(f"Error extracting weather data: {e}")
 
-    # 2. Extract Terrain
-    dem_val = None
-    slope_val = None
+    terrain = {}
+    flood_prob, local, global_fi = None, None, {}
     try:
-        workspace = os.environ.get("PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-        dem_path = os.path.join(workspace, "Processing", "assam_glo30_dem.tif")
-        slope_path = os.path.join(workspace, "Processing", "assam_slope_corrected.tif")
-        
-        with rasterio.open(dem_path) as src:
-            for val in src.sample([(lon, lat)]):
-                dem_val = float(val[0])
-                
-        with rasterio.open(slope_path) as src:
-            for val in src.sample([(lon, lat)]):
-                slope_val = float(val[0])
+        terrain = terrain_at(lat, lon)
+        if flood_model is not None and rainfall_data is not None and np.isfinite(terrain.get('elevation', np.nan)):
+            values = dict(terrain)
+            values.update(fb.rainfall_features(rainfall_data, soil))
+            flood_prob, local, global_fi = _predict(flood_model, fb.FLOOD_FEATURES, values)
     except Exception as e:
-        pass
+        logger.error(f"Flood inference error: {e}")
 
-    s1_curr_date = "2026-05-26"
-    s1_prev_date = "2026-05-14"
-    
-    s1_vv = None
-    s1_vh = None
-    s1_vv_prev = None
-    s1_vh_prev = None
-    s1_vv_change = None
-    s1_vh_change = None
-    s1_ratio = None
-    
-    try:
-        workspace = os.environ.get("PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-        s1_dir = os.path.join(workspace, "sentel", "sentinel", "output", "2026")
-        
-        # We only have one successful .dim file for 2026 due to corrupt zip archives
-        curr_dim = os.path.join(s1_dir, "S1A_IW_GRDH_1SDV_20260526T115657_20260526T115722_064688_082639_2896_Orb_Cal_Spk_TC.dim")
-        curr_data = curr_dim.replace(".dim", ".data")
-        curr_vv_img = os.path.join(curr_data, "Sigma0_VV.img")
-        curr_vh_img = os.path.join(curr_data, "Sigma0_VH.img")
-        
-        if os.path.exists(curr_vv_img):
-            with rasterio.open(curr_vv_img) as src:
-                for val in src.sample([(lon, lat)]):
-                    s1_vv = float(val[0])
-            with rasterio.open(curr_vh_img) as src:
-                for val in src.sample([(lon, lat)]):
-                    s1_vh = float(val[0])
-                    
-        # Impute previous with current to allow CatBoost to run (change = 0)
-        s1_vv_prev = s1_vv
-        s1_vh_prev = s1_vh
-                    
-        if s1_vv is not None and s1_vv_prev is not None and s1_vv > -999 and s1_vv_prev > -999:
-            s1_vv_change = s1_vv - s1_vv_prev
-        
-        if s1_vh is not None and s1_vh_prev is not None and s1_vh > -999 and s1_vh_prev > -999:
-            s1_vh_change = s1_vh - s1_vh_prev
-            
-        if s1_vv is not None and s1_vh is not None and s1_vh > -999 and s1_vv > -999:
-            s1_ratio = s1_vv / s1_vh if s1_vh != 0 else 0
-            
-    except Exception as e:
-        print(f"Error extracting Sentinel-1: {e}")
+    missing = []
+    if rainfall_data is None:
+        missing.append("live rainfall")
+    if not np.isfinite(terrain.get('elevation', np.nan)):
+        missing.append("terrain")
 
-    # 4. Feature Construction & Inference
-    flood_prob = None
-    
-    local_contributions = {}
-    global_feature_importance = {}
-    
-    try:
-        model = flood_cb_model
-        if model is not None:
-
-            feature_dict = {
-                'rain_intensity': rainfall_data.get("24h_mm", 0) if rainfall_data else np.nan,
-                'rainfall_1d': rainfall_data.get("24h_mm", 0) if rainfall_data else np.nan,
-                'rainfall_3d': rainfall_data.get("3d_mm", 0) if rainfall_data else np.nan,
-                'rainfall_7d': rainfall_data.get("7d_mm", 0) if rainfall_data else np.nan,
-                'antecedent_rainfall': rainfall_data.get("14d_mm", 0) if rainfall_data else np.nan,
-                'DEM': dem_val if dem_val is not None else np.nan,
-                'slope': slope_val if slope_val is not None else np.nan,
-                'flow_accumulation': np.nan,
-                'distance_to_river': np.nan,
-                'S1_VV': s1_vv if s1_vv is not None else np.nan,
-                'S1_VH': s1_vh if s1_vh is not None else np.nan,
-                'S1_VV_change': s1_vv_change if s1_vv_change is not None else np.nan,
-                'S1_VH_change': s1_vh_change if s1_vh_change is not None else np.nan,
-                'S1_VV_VH_ratio': s1_ratio if s1_ratio is not None else np.nan
-            }
-            
-            feature_names = model.feature_names_
-            
-            missing_features = [f for f in feature_names if feature_dict.get(f) is None or np.isnan(feature_dict.get(f))]
-            features = [feature_dict.get(f_name, np.nan) for f_name in feature_names]
-            
-            flood_prob = float(model.predict_proba([features])[0][1])
-            
-            # Extract actual global feature importances
-            if hasattr(model, 'get_feature_importance'):
-                importances = model.get_feature_importance()
-                for name, imp in zip(feature_names, importances):
-                    global_feature_importance[name] = float(imp)
-                    
-            # Skip SHAP for speed/simplicity in the CatBoost V2 version
-            local_contributions = None
-                
-    except Exception as e:
-        print(f"Inference error: {e}")
-
-    # CASE 1: Prediction Available
     return {
         "available": flood_prob is not None,
         "floodProbability": round(flood_prob, 4) if flood_prob is not None else None,
-        "model": "Flood CatBoost V1",
+        "floodClass": flood_prob >= FLOOD_THRESHOLD if flood_prob is not None else None,
+        "threshold": FLOOD_THRESHOLD,
+        "model": "Flood CatBoost v5",
         "predictionDate": datetime.now().isoformat(),
-        "missingFeatures": [] if flood_prob is not None else ["Some features missing"],
+        "missingFeatures": missing,
         "rainfall": {
             "intensity": rainfall_data.get("24h_mm") if rainfall_data else None,
             "1d": rainfall_data.get("24h_mm") if rainfall_data else None,
@@ -277,19 +170,13 @@ async def calculate_flood_risk(lat: float, lon: float):
             "7d": rainfall_data.get("7d_mm") if rainfall_data else None,
             "antecedent": rainfall_data.get("14d_mm") if rainfall_data else None
         },
-        "sentinel1": {
-            "vv": round(s1_vv, 4) if s1_vv and s1_vv > -999 else None,
-            "vh": round(s1_vh, 4) if s1_vh and s1_vh > -999 else None,
-            "vvChange": round(s1_vv_change, 4) if s1_vv_change is not None else None,
-            "vhChange": round(s1_vh_change, 4) if s1_vh_change is not None else None,
-            "ratio": round(s1_ratio, 4) if s1_ratio is not None else None,
-            "currentDate": s1_curr_date,
-            "previousDate": s1_prev_date
-        },
+        "soilMoisture": soil,
+        "sentinel1": _sentinel1_display(lat, lon),
         "terrain": {
-            "dem": round(dem_val, 2) if dem_val is not None else None,
-            "slope": round(slope_val, 2) if slope_val is not None else None
+            "dem": round(terrain['elevation'], 2) if np.isfinite(terrain.get('elevation', np.nan)) else None,
+            "slope": round(terrain['slope'], 2) if np.isfinite(terrain.get('slope', np.nan)) else None,
+            "relativeElevation5km": round(terrain['rel_elev_5km'], 2) if np.isfinite(terrain.get('rel_elev_5km', np.nan)) else None,
         },
-        "localContributions": local_contributions,
-        "globalFeatureImportance": global_feature_importance
+        "localContributions": local,
+        "globalFeatureImportance": global_fi
     }
