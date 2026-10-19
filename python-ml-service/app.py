@@ -82,6 +82,8 @@ async def get_risk(latitude: float = Query(..., description="Latitude"),
     else:
         # Map metric value to 'change' for /risk consistency as requested
         sar_data["change"] = sar_data["value"]
+        
+    terrain_data['sar_change'] = sar_data.get("change")
     
     t_raster_end = time.perf_counter()
     raster_ms = round((t_raster_end - t_raster_start) * 1000, 2)

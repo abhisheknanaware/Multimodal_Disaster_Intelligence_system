@@ -20,6 +20,7 @@ ASPECT_RASTER_PATH = os.path.join(workspace, "Processing", "assam_aspect.tif")
 TRI_RASTER_PATH = os.path.join(workspace, "Processing", "assam_TRI.tif")
 TPI_RASTER_PATH = os.path.join(workspace, "Processing", "assam_TPI.tif")
 DEM_RASTER_PATH = os.path.join(workspace, "Processing", "assam_glo30_dem.tif")
+S2_MOSAIC_PATH = os.path.join(workspace, "data", "sentinel2", "2025", "processed", "S2_Mosaic_NDVI_NDWI.tif")
 
 # Global rasterio dataset readers
 _raster_dataset = None
@@ -29,10 +30,11 @@ _aspect_dataset = None
 _tri_dataset = None
 _tpi_dataset = None
 _dem_dataset = None
+_s2_mosaic_dataset = None
 
 def init_raster():
     """Initializes the global raster dataset readers."""
-    global _raster_dataset, _slope_dataset, _sar_dataset, _aspect_dataset, _tri_dataset, _tpi_dataset, _dem_dataset
+    global _raster_dataset, _slope_dataset, _sar_dataset, _aspect_dataset, _tri_dataset, _tpi_dataset, _dem_dataset, _s2_mosaic_dataset
     if _raster_dataset is None:
         logger.info(f"Opening raster dataset: {BASELINE_RASTER_PATH}")
         _raster_dataset = rasterio.open(BASELINE_RASTER_PATH)
@@ -54,12 +56,14 @@ def init_raster():
         if _tri_dataset is None: _tri_dataset = rasterio.open(TRI_RASTER_PATH)
         if _tpi_dataset is None: _tpi_dataset = rasterio.open(TPI_RASTER_PATH)
         if _dem_dataset is None: _dem_dataset = rasterio.open(DEM_RASTER_PATH)
+        if _s2_mosaic_dataset is None and os.path.exists(S2_MOSAIC_PATH):
+            _s2_mosaic_dataset = rasterio.open(S2_MOSAIC_PATH)
     except Exception as e:
         logger.error(f"Failed to open terrain terrain rasters: {e}")
 
 def close_raster():
     """Closes the global raster dataset readers."""
-    global _raster_dataset, _slope_dataset, _sar_dataset, _aspect_dataset, _tri_dataset, _tpi_dataset, _dem_dataset
+    global _raster_dataset, _slope_dataset, _sar_dataset, _aspect_dataset, _tri_dataset, _tpi_dataset, _dem_dataset, _s2_mosaic_dataset
     if _raster_dataset is not None:
         logger.info("Closing raster dataset.")
         _raster_dataset.close()
@@ -128,7 +132,9 @@ def get_terrain_at_location(lat: float, lon: float):
         'aspect': None,
         'tri': None,
         'tpi': None,
-        'dem': None
+        'dem': None,
+        's2_ndvi': None,
+        's2_ndwi': None
     }
     
     datasets = {
@@ -138,6 +144,27 @@ def get_terrain_at_location(lat: float, lon: float):
         'tpi': _tpi_dataset,
         'dem': _dem_dataset
     }
+    
+    # Process S2 Mosaic separately since it has 2 bands
+    if _s2_mosaic_dataset is not None:
+        try:
+            ds = _s2_mosaic_dataset
+            query_lon, query_lat = lon, lat
+            if ds.crs and ds.crs.to_string() == 'EPSG:32646':
+                query_lon, query_lat = transformer_4326_to_32646.transform(lon, lat)
+            
+            bounds = ds.bounds
+            if (bounds.left <= query_lon <= bounds.right and bounds.bottom <= query_lat <= bounds.top):
+                row, col = ds.index(query_lon, query_lat)
+                if 0 <= row < ds.height and 0 <= col < ds.width:
+                    window = Window(col, row, 1, 1)
+                    data = ds.read(window=window)
+                    if ds.nodata is None or data[0, 0, 0] != ds.nodata:
+                        terrain_data['s2_ndvi'] = float(data[0, 0, 0])
+                    if ds.nodata is None or data[1, 0, 0] != ds.nodata:
+                        terrain_data['s2_ndwi'] = float(data[1, 0, 0])
+        except Exception as e:
+            logger.error(f"Error reading S2 Mosaic: {e}")
     
     for key, ds in datasets.items():
         if ds is None:

@@ -4,21 +4,34 @@ import pandas as pd
 import numpy as np
 import catboost
 
-# Load the previously trained Sentinel-1 + Terrain + S2 model
+# Load the previously trained V4 Advanced model
 try:
     workspace = os.environ.get("PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    ls_cb_model_path = r"D:\models_v3\landslide_catboost_v3.cbm"
+    ls_cb_model_path = os.path.join(workspace, "models", "landslide_v4_advanced.cbm")
     if os.path.exists(ls_cb_model_path):
-        landslide_cb_model = catboost.CatBoostClassifier()
+        landslide_cb_model = catboost.CatBoostRegressor()
         landslide_cb_model.load_model(ls_cb_model_path)
         ls_cb_feature_names = landslide_cb_model.feature_names_
     else:
         landslide_cb_model = None
         ls_cb_feature_names = []
 except Exception as e:
-    print(f"Error loading v2 model: {e}")
+    print(f"Error loading v4 model: {e}")
     landslide_cb_model = None
     ls_cb_feature_names = []
+
+# Load the flood classifier once at startup (override with FLOOD_MODEL_PATH)
+try:
+    flood_model_path = os.environ.get("FLOOD_MODEL_PATH", os.path.join(workspace, "models", "flood_catboost_v3.cbm"))
+    if os.path.exists(flood_model_path):
+        flood_cb_model = catboost.CatBoostClassifier()
+        flood_cb_model.load_model(flood_model_path)
+    else:
+        print(f"Flood model not found at {flood_model_path}")
+        flood_cb_model = None
+except Exception as e:
+    print(f"Error loading flood model: {e}")
+    flood_cb_model = None
 
 def calculate_dynamic_risk(terrain_data: dict, rainfall: dict, forecast: dict, s2_data: dict = None) -> dict:
     """
@@ -37,43 +50,54 @@ def calculate_dynamic_risk(terrain_data: dict, rainfall: dict, forecast: dict, s
     try:
         r24 = forecast.get("24h_mm", 0)
         
-        # Build the exact feature array expected by the v3 model (S2 REMOVED DUE TO MISSINGNESS BIAS)
+        # Build the exact 13-feature array expected by the V4 model
+        r24 = forecast.get("24h_mm", 0)
+        
+        slope = terrain_data.get('slope', 0)
+        aspect = terrain_data.get('aspect', 0)
+        tpi = terrain_data.get('tpi', 0)
+        
+        northness = np.cos(np.radians(aspect)) if aspect is not None else 0
+        eastness = np.sin(np.radians(aspect)) if aspect is not None else 0
+        
+        safe_slope = max(0.001, np.radians(slope)) if slope is not None else 0.001
+        twi_proxy = -tpi / np.tan(safe_slope) if tpi is not None else 0
+        erosion_potential = (r24 * np.tan(safe_slope)) if r24 is not None else 0
+        
+        # In V4, 'elevation' maps to 'dem'
         feature_dict = {
-            'dem': terrain_data.get('dem') if terrain_data.get('dem') is not None else np.nan,
-            'slope': terrain_data.get('slope') if terrain_data.get('slope') is not None else np.nan,
-            'aspect': terrain_data.get('aspect') if terrain_data.get('aspect') is not None else np.nan,
+            'slope': slope if slope is not None else np.nan,
+            'elevation': terrain_data.get('dem') if terrain_data.get('dem') is not None else np.nan,
+            'tpi': tpi if tpi is not None else np.nan,
             'tri': terrain_data.get('tri') if terrain_data.get('tri') is not None else np.nan,
-            'tpi': terrain_data.get('tpi') if terrain_data.get('tpi') is not None else np.nan,
-            'rainfall': r24 if r24 is not None else np.nan
+            'aspect': aspect if aspect is not None else np.nan,
+            'sar_change': terrain_data.get('sar_change') if terrain_data.get('sar_change') is not None else np.nan,
+            'rainfall': r24 if r24 is not None else np.nan,
+            's2_ndvi': terrain_data.get('s2_ndvi') if terrain_data.get('s2_ndvi') is not None else np.nan,
+            's2_ndwi': terrain_data.get('s2_ndwi') if terrain_data.get('s2_ndwi') is not None else np.nan,
+            'northness': northness,
+            'eastness': eastness,
+            'twi_proxy': twi_proxy,
+            'erosion_potential': erosion_potential
         }
         
-        # The model expects historical S1 dates. We pad with realistic SAR dB values.
         features = []
         missing_features = []
         for f_name in ls_cb_feature_names:
-            if "S1_" in f_name and "_VH" in f_name:
-                features.append(-18.0)
-            elif "S1_" in f_name and "_VV" in f_name:
-                features.append(-12.0)
+            val = feature_dict.get(f_name)
+            if val is None or np.isnan(val):
+                missing_features.append(f_name)
+                # Let CatBoost handle missing values natively
+                features.append(np.nan)
             else:
-                val = feature_dict.get(f_name)
-                if val is None or np.isnan(val):
-                    missing_features.append(f_name)
-                    features.append(np.nan) # Let CatBoost handle missing
-                else:
-                    features.append(val)
+                features.append(val)
                     
         if len(missing_features) > 3:
             print(f"Warning: Missing features {missing_features}. Prediction might be degraded.")
             
-        prob = float(landslide_cb_model.predict_proba([features])[0][1])
-        
-        # SCALER:
-        # User requested scalability to reduce probabilities driven by the slope feature,
-        # restricting the final output to strictly between 40% and 60%.
-        # We map the 0-1 model probability to the 0.40-0.60 range.
-        prob = 0.40 + (prob * 0.20)
-        prob = max(0.40, min(0.60, prob))
+        # V4 is a regressor on 0-1 susceptibility; clip to keep it a valid probability
+        prob = float(landslide_cb_model.predict([features])[0])
+        prob = max(0.0, min(1.0, prob))
         
         result["probability"] = round(prob, 4)
         
@@ -200,12 +224,9 @@ async def calculate_flood_risk(lat: float, lon: float):
     global_feature_importance = {}
     
     try:
-        import catboost
-        model_path = r"D:\models_v3\flood_catboost_v3.cbm"
-        if os.path.exists(model_path):
-            model = catboost.CatBoostClassifier()
-            model.load_model(model_path)
-            
+        model = flood_cb_model
+        if model is not None:
+
             feature_dict = {
                 'rain_intensity': rainfall_data.get("24h_mm", 0) if rainfall_data else np.nan,
                 'rainfall_1d': rainfall_data.get("24h_mm", 0) if rainfall_data else np.nan,
@@ -228,13 +249,7 @@ async def calculate_flood_risk(lat: float, lon: float):
             missing_features = [f for f in feature_names if feature_dict.get(f) is None or np.isnan(feature_dict.get(f))]
             features = [feature_dict.get(f_name, np.nan) for f_name in feature_names]
             
-            prob = model.predict_proba([features])[0][1]
-            
-            # SCALER:
-            # User requested probabilities to be scaled lower (around 30%)
-            slope_factor = (slope_val if slope_val is not None else 0) / 90.0
-            flood_prob = 0.28 + (slope_factor * 0.15)
-            flood_prob = max(0.20, min(0.45, flood_prob))
+            flood_prob = float(model.predict_proba([features])[0][1])
             
             # Extract actual global feature importances
             if hasattr(model, 'get_feature_importance'):

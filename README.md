@@ -92,12 +92,12 @@ Place them at these exact paths:
 | `sentel/sentinel/output/2026/S1A_IW_GRDH_..._TC.dim` + `.data/` folder | ~5 GB |
 | `data/sentinel2/2025/processed/*.tif` | ~3 GB |
 
-### 2. Trained v3 models (~0.5 MB)
+### 2. Trained models
 
-The ML service loads these from `D:\models_v3\`:
+The ML service loads these from `models/` (relative to `PROJECT_ROOT`):
 
-- `landslide_catboost_v3.cbm`
-- `flood_catboost_v3.cbm`
+- `landslide_v4_advanced.cbm`
+- `flood_catboost_v3.cbm` (override with `FLOOD_MODEL_PATH`)
 
 Without them, risk predictions return `0`.
 
