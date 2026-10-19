@@ -41,6 +41,26 @@ except Exception:
 LANDSLIDE_THRESHOLD = _metrics.get("landslide", {}).get("deploy_threshold", 0.5)
 FLOOD_THRESHOLD = _metrics.get("flood", {}).get("deploy_threshold", 0.5)
 TRIGGER_SCALE = _metrics.get("landslide_trigger", {}).get("trigger_scale", 1.0)
+TRIGGER_RAIN_SCALE = _metrics.get("landslide_trigger", {}).get("rain_scale", "era5")
+
+
+def calibrated(prob: float, model_key: str) -> float:
+    """Platt-scaled probability fitted on out-of-fold predictions (identity if not trained)."""
+    cal = _metrics.get(model_key, {}).get("calibration")
+    if not cal:
+        return prob
+    p = min(max(prob, 1e-6), 1 - 1e-6)
+    return float(1.0 / (1.0 + np.exp(-(cal["a"] * np.log(p / (1 - p)) + cal["b"]))))
+
+
+def _level_thresholds(model_key: str):
+    levels = _metrics.get(model_key, {}).get("alert_levels", {})
+    return (levels.get("watch", {}).get("threshold", 1.1), levels.get("alert", {}).get("threshold", 1.1))
+
+
+def alert_level(model_key: str, prob_cal: float) -> str:
+    watch, alert = _level_thresholds(model_key)
+    return "ALERT" if prob_cal >= alert else "WATCH" if prob_cal >= watch else "NONE"
 
 
 @lru_cache(maxsize=4096)
@@ -68,10 +88,12 @@ def rain_trigger(lat: float, lon: float, rainfall: dict, soil_moisture=None):
     from dated GSI + NASA GLC events. Falls back to the IMD-threshold rule without the model.
     """
     if trigger_model is None:
-        return fb.landslide_rain_trigger(rainfall.get("24h_mm", 0), rainfall.get("3d_mm", 0)), None
+        return fb.landslide_rain_trigger(rainfall.get("24h_mm", 0), rainfall.get("3d_mm", 0)), None, None
+    if TRIGGER_RAIN_SCALE == "imd":
+        rainfall = fb.to_imd_scale(rainfall)  # trained on IMD gauge rain
     values = fb.trigger_features(rainfall, soil_moisture, fb.rain_climatology(lat, lon))
     raw, local, _ = _predict(trigger_model, fb.TRIGGER_FEATURES, values)
-    return round(min(1.0, raw / TRIGGER_SCALE), 4), local
+    return round(min(1.0, raw / TRIGGER_SCALE), 4), local, calibrated(raw, "landslide_trigger")
 
 
 def calculate_dynamic_risk(lat: float, lon: float, rainfall: dict, soil_moisture=None) -> dict:
@@ -85,12 +107,26 @@ def calculate_dynamic_risk(lat: float, lon: float, rainfall: dict, soil_moisture
         return result
     try:
         terrain = terrain_at(lat, lon)
-        susceptibility, local, global_fi = _predict(landslide_model, fb.LANDSLIDE_FEATURES, terrain)
-        trigger, trigger_local = rain_trigger(lat, lon, rainfall, soil_moisture)
+        raw_susc, local, global_fi = _predict(landslide_model, fb.LANDSLIDE_FEATURES, terrain)
+        susceptibility = calibrated(raw_susc, "landslide")
+        trigger, trigger_local, trigger_cal = rain_trigger(lat, lon, rainfall, soil_moisture)
+
+        # WATCH / ALERT need both a susceptible slope and triggering rain
+        s_watch, s_alert = _level_thresholds("landslide")
+        t_watch, t_alert = _level_thresholds("landslide_trigger")
+        level = "NONE"
+        if trigger_cal is not None:
+            if susceptibility >= s_alert and trigger_cal >= t_alert:
+                level = "ALERT"
+            elif susceptibility >= s_watch and trigger_cal >= t_watch:
+                level = "WATCH"
+
         result.update({
             "probability": round(susceptibility * trigger, 4),
             "susceptibility": round(susceptibility, 4),
-            "susceptibleClass": susceptibility >= LANDSLIDE_THRESHOLD,
+            "susceptibilityRaw": round(raw_susc, 4),
+            "susceptibleClass": raw_susc >= LANDSLIDE_THRESHOLD,
+            "alertLevel": level,
             "rainTrigger": trigger,
             "triggerContributions": trigger_local,
             "localContributions": local,
@@ -153,13 +189,14 @@ async def calculate_flood_risk(lat: float, lon: float):
         logger.error(f"Error extracting weather data: {e}")
 
     terrain = {}
-    flood_prob, local, global_fi = None, None, {}
+    flood_prob, raw_flood, local, global_fi = None, None, None, {}
     try:
         terrain = terrain_at(lat, lon)
         if flood_model is not None and rainfall_data is not None and np.isfinite(terrain.get('elevation', np.nan)):
             values = dict(terrain)
             values.update(fb.rainfall_features(rainfall_data, soil))
-            flood_prob, local, global_fi = _predict(flood_model, fb.FLOOD_FEATURES, values)
+            raw_flood, local, global_fi = _predict(flood_model, fb.FLOOD_FEATURES, values)
+            flood_prob = calibrated(raw_flood, "flood")
     except Exception as e:
         logger.error(f"Flood inference error: {e}")
 
@@ -172,7 +209,8 @@ async def calculate_flood_risk(lat: float, lon: float):
     return {
         "available": flood_prob is not None,
         "floodProbability": round(flood_prob, 4) if flood_prob is not None else None,
-        "floodClass": flood_prob >= FLOOD_THRESHOLD if flood_prob is not None else None,
+        "floodClass": raw_flood >= FLOOD_THRESHOLD if flood_prob is not None else None,
+        "alertLevel": alert_level("flood", flood_prob) if flood_prob is not None else None,
         "threshold": FLOOD_THRESHOLD,
         "model": "Flood CatBoost v5",
         "predictionDate": datetime.now().isoformat(),
