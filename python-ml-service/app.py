@@ -178,6 +178,7 @@ async def get_risk(latitude: float = Query(..., description="Latitude"),
         "globalFeatureImportance": current_risk_data.get("globalFeatureImportance"),
         "riskFactorWeighting": riskFactorWeighting,
         "risk_class": risk_class,
+        "alertLevel": current_risk_data.get("alertLevel"),
         "timestamps": {
             "weather": weather_metrics.get("retrieved_at"),
             "generated": datetime.datetime.now(datetime.timezone.utc).isoformat()

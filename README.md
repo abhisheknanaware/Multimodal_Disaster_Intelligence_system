@@ -96,35 +96,64 @@ Place them at these exact paths:
 
 The ML service loads v5 models from `models/v5/` (override with `MODEL_DIR`):
 
-- `landslide_v5.cbm` — terrain susceptibility classifier (terrain, hydrology, distance to road, rainfall climatology)
-- `landslide_trigger_v5.cbm` — rainfall trigger learned from 524 dated slides (GSI inventory dates + NASA Global Landslide Catalog, NE India); live landslide risk = susceptibility × trigger
-- `flood_v5.cbm` — live Open-Meteo rainfall + soil moisture + floodplain/hydrology features, monotonic in rainfall
-- `imd_monsoon_climatology.npz` — IMD 2020–2025 Jun–Sep rainfall climatology
-- `osm_roads_points.npz` — OpenStreetMap major roads (© OpenStreetMap contributors, ODbL) for distance-to-road
-- `metrics_v5.json` — cross-validation metrics, decision thresholds and trigger scale
+- `landslide_v5.cbm` — susceptibility classifier: terrain, hydrology, distance to road, soil (SoilGrids), rock type (GLiM), rainfall climatology
+- `landslide_trigger_v5.cbm` — rainfall trigger learned from 524 dated slides (GSI inventory dates + NASA Global Landslide Catalog, NE India), trained on IMD gauge rainfall; live Open-Meteo rain is mapped onto the IMD scale (`rain_qm_era5_to_imd.npz`)
+- `flood_v5.cbm` — trained on 2025 SAR labels plus 2019–2024 Sentinel-1 labels (60 sites); live rainfall, soil moisture, floodplain and hydrology features; monotonic in rainfall
+- `imd_monsoon_climatology.npz`, `osm_roads_points.npz` (© OpenStreetMap contributors, ODbL), `rain_qm_era5_to_imd.npz`
+- `metrics_v5.json` — cross-validation metrics, calibration parameters, WATCH / ALERT thresholds
 
-The hydrology rasters (`Processing/assam_{flowacc,hand,dist_stream}_90m.tif`) are generated from the DEM.
+Probabilities are calibrated (Platt scaling on out-of-fold predictions). Each hazard returns an `alertLevel`:
 
-Rebuild:
+- `WATCH`: catches about 90% of events (high recall)
+- `ALERT`: high-precision level for SMS dispatch
+
+A landslide `ALERT` requires both a susceptible slope and triggering rain.
+
+Generated rasters (git-ignored, rebuild locally):
+
+| File | Script |
+|---|---|
+| `Processing/assam_{flowacc,hand,dist_stream}_90m.tif` | `build_hydrology.py` |
+| `Processing/assam_soilgrids_250m.tif` | `build_soil_lithology.py soil` (ISRIC SoilGrids, CC-BY 4.0) |
+| `Processing/assam_lithology_250m.tif` | `build_soil_lithology.py lithology` (needs the GLiM geodatabase in `data/v5/external/glim/`) |
+
+Rebuild everything:
 
 ```bash
 python training_scripts/build_hydrology.py
+python training_scripts/build_soil_lithology.py
 python training_scripts/build_v5_datasets.py
 python training_scripts/build_trigger_dataset.py
+python training_scripts/add_imd_to_trigger.py
+python training_scripts/build_flood_s1_labels.py
 python training_scripts/train_v5_models.py
 ```
 
-`build_hydrology.py roads` needs the Overpass export at `data/v5/external/osm_roads_assam.json`, and the trigger dataset needs the NASA GLC CSV at `data/v5/external/nasa_glc.csv`. Training and serving share the same feature code, `python-ml-service/feature_builder.py`.
+External inputs live in `data/v5/external/` (git-ignored):
+
+- **Roads:** OSM Overpass export
+- **Dated landslides:** NASA GLC CSV
+- **Rainfall:** IMD `RF25_ind{year}_rfp25.nc` for 2007–2019 (from imdpune.gov.in)
+- **Lithology:** GLiM `LiMW_GIS_2015.gdb.zip`
+
+Sentinel-1 RTC and JRC surface water are read anonymously from Microsoft Planetary Computer. Training and serving share `python-ml-service/feature_builder.py`.
 
 | Model | Validation | ROC-AUC | Macro-F1 | Precision | Recall |
 |---|---|---|---|---|---|
 | Landslide v4 (old) | spatial CV | 0.741 | 0.656 | 0.494 | 0.501 |
-| **Landslide susceptibility v5** | spatial CV, road-matched negatives | **0.882** | **0.752** | **0.614** | **0.676** |
+| **Landslide susceptibility** | spatial CV, road-matched negatives | **0.897** | **0.789** | **0.650** | **0.759** |
 | IMD rainfall rule (old trigger) | same rows | 0.767 | 0.618 | 0.284 | 0.347 |
-| **Landslide trigger v5** | leave-one-year-out | **0.787** | **0.619** | 0.275 | **0.387** |
-| Flood, old features without S1 | spatial CV | 0.888 | 0.798 | 0.726 | 0.858 |
-| **Flood v5** | spatial CV | **0.886** | **0.834** | **0.767** | **0.884** |
-| **Flood v5** | leave-one-date-out | 0.862 | 0.821 | 0.752 | 0.874 |
+| **Landslide trigger**, live path | leave-one-year-out | **0.784** | **0.628** | **0.306** | 0.355 |
+| Landslide trigger, IMD rainfall | leave-one-year-out | 0.833 | 0.682 | 0.385 | 0.488 |
+| Flood, old features without S1 (2025 only) | spatial CV | 0.891 | 0.807 | 0.733 | 0.871 |
+| **Flood** (2019–2025, ~3% flooded) | leave-one-year-out | 0.862 | 0.744 | 0.679 | 0.409 |
+| **Flood**, 2025 rows | spatial CV | 0.885 | 0.739 | 0.838 | 0.550 |
+| Flood trained on 2019–2024 only | external test on 2025 | 0.847 | — | — | — |
+
+Notes:
+
+- The "live path" trigger row is what the API achieves: trained on IMD, fed mapped Open-Meteo rain. The IMD row is reachable with a live gauge or IMERG feed.
+- Flood scores across 2019–2025 reflect realistic rarity (about 3% of observations flooded). Precision and F1 are not comparable with the balanced 2025-only set.
 
 Without them, risk predictions return `0`.
 

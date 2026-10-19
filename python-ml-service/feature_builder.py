@@ -23,6 +23,16 @@ ROADS_PATH = os.path.join(workspace, "models", "v5", "osm_roads_points.npz")
 FLOWACC_PATH = os.path.join(workspace, "Processing", "assam_flowacc_90m.tif")
 HAND_PATH = os.path.join(workspace, "Processing", "assam_hand_90m.tif")
 DIST_STREAM_PATH = os.path.join(workspace, "Processing", "assam_dist_stream_90m.tif")
+SOIL_PATH = os.path.join(workspace, "Processing", "assam_soilgrids_250m.tif")
+LITHO_PATH = os.path.join(workspace, "Processing", "assam_lithology_250m.tif")
+RAIN_QM_PATH = os.path.join(workspace, "models", "v5", "rain_qm_era5_to_imd.npz")
+
+# SoilGrids 2.0 bands (stored units: clay/sand/silt g/kg, bdod cg/cm3, soc dg/kg, cfvo cm3/dm3)
+SOIL_BANDS = [f"{p}_{d}" for d in ("0-5cm", "30-60cm") for p in ("clay", "sand", "silt", "bdod", "soc", "cfvo")]
+# GLiM first-level classes: unconsolidated / siliciclastic / mixed / carbonate sediments,
+# metamorphics, acid / basic / intermediate plutonics, water bodies
+LITHO_CLASSES = ["su", "ss", "sm", "sc", "mt", "pa", "pb", "pi", "wb"]
+LITHO_FEATURES = ["lith_unconsolidated", "lith_siliciclastic", "lith_mixed_sed", "lith_metamorphic", "lith_plutonic"]
 
 _to_utm46 = Transformer.from_crs("EPSG:4326", "EPSG:32646", always_xy=True)
 
@@ -33,6 +43,9 @@ LANDSLIDE_FEATURES = [
     'slope_mean_1500m', 'relief_5km', 'elev_std_1500m',
     'rain_clim_jjas', 'heavy_rain_days',
     'dist_road_m', 'dist_stream_m', 'hand_m', 'log_flowacc', 'log_flowacc_2km',
+    'clay_0-5cm', 'sand_0-5cm', 'bdod_0-5cm', 'soc_0-5cm', 'cfvo_0-5cm',
+    'clay_30-60cm', 'sand_30-60cm', 'cfvo_30-60cm',
+    'lith_unconsolidated', 'lith_siliciclastic', 'lith_mixed_sed', 'lith_metamorphic', 'lith_plutonic',
 ]
 
 FLOOD_FEATURES = [
@@ -105,6 +118,61 @@ def hydrology_features(lat: float, lon: float) -> dict:
         'hand_m': hand,
         'dist_stream_m': dist,
     }
+
+
+def soil_lithology_features(lat: float, lon: float) -> dict:
+    """SoilGrids texture/density/gravel and GLiM rock type at a point (NaN if rasters missing)."""
+    out = {}
+    if os.path.exists(SOIL_PATH):
+        ds = _open(SOIL_PATH)
+        row, col = ds.index(lon, lat)
+        if 0 <= row < ds.height and 0 <= col < ds.width:
+            vals = ds.read(window=Window(col, row, 1, 1))[:, 0, 0].astype(float)
+            vals[vals == ds.nodata] = np.nan
+            out.update(dict(zip(SOIL_BANDS, vals)))
+    code = 0
+    if os.path.exists(LITHO_PATH):
+        ds = _open(LITHO_PATH)
+        row, col = ds.index(lon, lat)
+        if 0 <= row < ds.height and 0 <= col < ds.width:
+            code = int(ds.read(1, window=Window(col, row, 1, 1))[0, 0])
+    cls = LITHO_CLASSES[code - 1] if 0 < code <= len(LITHO_CLASSES) else None
+    out.update({
+        'lith_unconsolidated': float(cls == 'su'),
+        'lith_siliciclastic': float(cls == 'ss'),
+        'lith_mixed_sed': float(cls in ('sm', 'sc')),
+        'lith_metamorphic': float(cls == 'mt'),
+        'lith_plutonic': float(cls in ('pa', 'pb', 'pi')),
+    } if cls is not None else {f: np.nan for f in LITHO_FEATURES})
+    for b in SOIL_BANDS:
+        out.setdefault(b, np.nan)
+    return out
+
+
+_rain_qm = None
+
+
+def to_imd_scale(rain: dict) -> dict:
+    """
+    Maps Open-Meteo (ERA5-like) rain windows onto the IMD gauge-gridded scale with a
+    quantile mapping fitted on 2007-2025 NE India daily pairs. An n-day window is mapped
+    through its mean daily rate: n * QM(sum / n).
+    """
+    global _rain_qm
+    if _rain_qm is None:
+        _rain_qm = dict(np.load(RAIN_QM_PATH))
+    q = _rain_qm
+
+    def qm(x):
+        return float(np.interp(x, q['src'], q['dst'])) if np.isfinite(x) else np.nan
+
+    out = dict(rain)
+    for key, n in (('24h_mm', 1), ('3d_mm', 3), ('7d_mm', 7), ('14d_mm', 14), ('30d_mm', 30)):
+        if key in rain and rain[key] is not None:
+            out[key] = n * qm(rain[key] / n)
+    if rain.get('max_daily_7d_mm') is not None:
+        out['max_daily_7d_mm'] = qm(rain['max_daily_7d_mm'])
+    return out
 
 
 def trigger_features(rain: dict, soil_moisture, clim: dict) -> dict:
@@ -189,6 +257,7 @@ def terrain_features(lat: float, lon: float) -> dict:
         'elev_std_1500m': stat(np.nanstd, dem_1500),
         **rain_climatology(lat, lon),
         **hydrology_features(lat, lon),
+        **soil_lithology_features(lat, lon),
         'dist_road_m': distance_to_road(lat, lon),
     }
 
