@@ -108,14 +108,21 @@ async def get_risk(latitude: float = Query(..., description="Latitude"),
         from s2_service import get_s2_at_location
         s2_data = get_s2_at_location(latitude, longitude)
         
-        current_risk_data = calculate_dynamic_risk(latitude, longitude, rainfall)
+        soil_now = (weather_metrics.get("soil_moisture") or {}).get("value")
+        current_risk_data = calculate_dynamic_risk(latitude, longitude, rainfall, soil_now)
         current_risk = current_risk_data.get("probability", 0.0)
 
-        # Shift the rainfall windows forward with forecast rain for the 24h / 72h horizons
-        risk_24h = calculate_dynamic_risk(latitude, longitude,
-            {"24h_mm": forecast["24h_mm"], "3d_mm": rainfall["3d_mm"] * 2 / 3 + forecast["24h_mm"]}).get("probability", 0.0)
-        risk_72h = calculate_dynamic_risk(latitude, longitude,
-            {"24h_mm": forecast["72h_mm"] / 3.0, "3d_mm": forecast["72h_mm"]}).get("probability", 0.0)
+        # Same rainfall windows, ending 24h / 72h ahead using the hourly forecast
+        horizons = weather_metrics.get("horizons", {})
+
+        def horizon_risk(key):
+            h = horizons.get(key)
+            if not h:
+                return current_risk
+            return calculate_dynamic_risk(latitude, longitude, h["rainfall"], h["soil_moisture"]).get("probability", 0.0)
+
+        risk_24h = horizon_risk("24h")
+        risk_72h = horizon_risk("72h")
 
         risk_class = get_risk_class(current_risk)
 
@@ -289,7 +296,7 @@ async def debug_landslide(lat: float, lng: float):
     # Genuine ML calculation
     import risk_engine
     features_list = risk_engine.fb.LANDSLIDE_FEATURES
-    dynamic_risk_data = calculate_dynamic_risk(lat, lng, rain)
+    dynamic_risk_data = calculate_dynamic_risk(lat, lng, rain, (weather.get("soil_moisture") or {}).get("value"))
     dynamic_risk = dynamic_risk_data.get("probability", 0.0)
     
     return {

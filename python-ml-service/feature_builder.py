@@ -1,5 +1,5 @@
 """
-Shared feature construction for the v5 landslide and flood models.
+Shared feature construction for the v5 landslide, landslide-trigger and flood models.
 
 The same functions are used by training_scripts/train_v5_models.py and by the
 live API, so the model always sees features computed the same way.
@@ -19,6 +19,10 @@ ASPECT_PATH = os.path.join(workspace, "Processing", "assam_aspect.tif")
 TRI_PATH = os.path.join(workspace, "Processing", "assam_TRI.tif")
 TPI_PATH = os.path.join(workspace, "Processing", "assam_TPI.tif")
 RAIN_CLIM_PATH = os.path.join(workspace, "models", "v5", "imd_monsoon_climatology.npz")
+ROADS_PATH = os.path.join(workspace, "models", "v5", "osm_roads_points.npz")
+FLOWACC_PATH = os.path.join(workspace, "Processing", "assam_flowacc_90m.tif")
+HAND_PATH = os.path.join(workspace, "Processing", "assam_hand_90m.tif")
+DIST_STREAM_PATH = os.path.join(workspace, "Processing", "assam_dist_stream_90m.tif")
 
 _to_utm46 = Transformer.from_crs("EPSG:4326", "EPSG:32646", always_xy=True)
 
@@ -28,18 +32,26 @@ LANDSLIDE_FEATURES = [
     'relief_500m', 'relief_1500m', 'rel_elev_1500m', 'curvature_proxy',
     'slope_mean_1500m', 'relief_5km', 'elev_std_1500m',
     'rain_clim_jjas', 'heavy_rain_days',
+    'dist_road_m', 'dist_stream_m', 'hand_m', 'log_flowacc', 'log_flowacc_2km',
 ]
 
 FLOOD_FEATURES = [
     'elevation', 'slope', 'relief_1500m', 'rel_elev_1500m', 'rel_elev_5km',
     'elev_pct_5km', 'low_flat_frac_1500m', 'slope_mean_1500m', 'elev_std_1500m',
     'rain_clim_jjas', 'heavy_rain_days',
-    'rain_1d', 'rain_3d', 'rain_7d', 'rain_14d', 'rain_30d',
-    'rain_3d_share_14d', 'soil_moisture',
+    'rain_1d', 'rain_3d', 'rain_7d', 'soil_moisture',
+    'hand_m', 'dist_stream_m', 'log_flowacc', 'log_flowacc_2km',
+]
+
+TRIGGER_FEATURES = [
+    'rain_1d', 'rain_3d', 'rain_7d', 'rain_14d', 'rain_30d', 'rain_3d_share_14d',
+    'soil_moisture', 'rain_hours_1d', 'rain_max_1d_7d',
+    'rain_3d_norm', 'rain_14d_norm', 'rain_clim_jjas',
 ]
 
 _datasets = {}
 _rain_clim = None
+_roads = None
 
 
 def _open(path):
@@ -65,6 +77,46 @@ def rain_climatology(lat: float, lon: float) -> dict:
     i = int(np.abs(c['lat'] - lat).argmin())
     j = int(np.abs(c['lon'] - lon).argmin())
     return {'rain_clim_jjas': float(c['jjas_mm'][i, j]), 'heavy_rain_days': float(c['heavy_days'][i, j])}
+
+
+def distance_to_road(lat: float, lon: float) -> float:
+    """Metres to the nearest OSM motorway/trunk/primary/secondary/tertiary road."""
+    global _roads
+    if _roads is None:
+        from scipy.spatial import cKDTree
+        _roads = cKDTree(np.load(ROADS_PATH)['xy_utm46'])
+    x, y = _to_utm46.transform(lon, lat)
+    return float(min(_roads.query((x, y))[0], 20000.0))
+
+
+def hydrology_features(lat: float, lon: float) -> dict:
+    """DEM-derived drainage descriptors (90 m) from training_scripts/build_hydrology.py."""
+    acc_ds = _open(FLOWACC_PATH)
+    hand = _point(_open(HAND_PATH), lon, lat)
+    dist = _point(_open(DIST_STREAM_PATH), lon, lat)
+
+    def log_max(radius_m):
+        win = _window(acc_ds, lon, lat, radius_m)
+        return float(np.log10(np.nanmax(win) + 1)) if np.isfinite(win).any() else np.nan
+
+    return {
+        'log_flowacc': log_max(500),
+        'log_flowacc_2km': log_max(2000),
+        'hand_m': hand,
+        'dist_stream_m': dist,
+    }
+
+
+def trigger_features(rain: dict, soil_moisture, clim: dict) -> dict:
+    """Inputs to the learned landslide rainfall-trigger model."""
+    f = rainfall_features(rain, soil_moisture)
+    f['rain_hours_1d'] = rain.get('hours_24h', np.nan)
+    f['rain_max_1d_7d'] = rain.get('max_daily_7d_mm', np.nan)
+    daily_clim = max(1.0, clim['rain_clim_jjas'] / 122.0)
+    f['rain_3d_norm'] = f['rain_3d'] / (3 * daily_clim)
+    f['rain_14d_norm'] = f['rain_14d'] / (14 * daily_clim)
+    f['rain_clim_jjas'] = clim['rain_clim_jjas']
+    return f
 
 
 def _valid(arr, ds):
@@ -136,6 +188,8 @@ def terrain_features(lat: float, lon: float) -> dict:
         'relief_5km': stat(np.nanmax, dem_5k) - stat(np.nanmin, dem_5k),
         'elev_std_1500m': stat(np.nanstd, dem_1500),
         **rain_climatology(lat, lon),
+        **hydrology_features(lat, lon),
+        'dist_road_m': distance_to_road(lat, lon),
     }
 
 

@@ -96,19 +96,35 @@ Place them at these exact paths:
 
 The ML service loads v5 models from `models/v5/` (override with `MODEL_DIR`):
 
-- `landslide_v5.cbm` — terrain susceptibility classifier; live risk = susceptibility × rainfall trigger (IMD heavy-rain classes)
-- `flood_v5.cbm` — live Open-Meteo rainfall + soil moisture + terrain/floodplain features, monotonic in rainfall
-- `imd_monsoon_climatology.npz` — IMD 2020–2025 Jun–Sep rainfall climatology used as a feature
-- `metrics_v5.json` — spatial / temporal cross-validation metrics and decision thresholds
+- `landslide_v5.cbm` — terrain susceptibility classifier (terrain, hydrology, distance to road, rainfall climatology)
+- `landslide_trigger_v5.cbm` — rainfall trigger learned from 524 dated slides (GSI inventory dates + NASA Global Landslide Catalog, NE India); live landslide risk = susceptibility × trigger
+- `flood_v5.cbm` — live Open-Meteo rainfall + soil moisture + floodplain/hydrology features, monotonic in rainfall
+- `imd_monsoon_climatology.npz` — IMD 2020–2025 Jun–Sep rainfall climatology
+- `osm_roads_points.npz` — OpenStreetMap major roads (© OpenStreetMap contributors, ODbL) for distance-to-road
+- `metrics_v5.json` — cross-validation metrics, decision thresholds and trigger scale
 
-Rebuild with `python training_scripts/build_v5_datasets.py` then `python training_scripts/train_v5_models.py`. Features for training and serving come from the same module, `python-ml-service/feature_builder.py`.
+The hydrology rasters (`Processing/assam_{flowacc,hand,dist_stream}_90m.tif`) are generated from the DEM.
 
-| Model (spatial CV) | ROC-AUC | Macro-F1 | Precision | Recall |
-|---|---|---|---|---|
-| Landslide v4 (old) | 0.712 | 0.633 | 0.449 | 0.501 |
-| **Landslide v5** | **0.845** | **0.729** | **0.557** | **0.703** |
-| Flood, old features without S1 | 0.891 | 0.807 | 0.733 | 0.871 |
-| **Flood v5** | **0.888** | **0.813** | **0.726** | **0.911** |
+Rebuild:
+
+```bash
+python training_scripts/build_hydrology.py
+python training_scripts/build_v5_datasets.py
+python training_scripts/build_trigger_dataset.py
+python training_scripts/train_v5_models.py
+```
+
+`build_hydrology.py roads` needs the Overpass export at `data/v5/external/osm_roads_assam.json`, and the trigger dataset needs the NASA GLC CSV at `data/v5/external/nasa_glc.csv`. Training and serving share the same feature code, `python-ml-service/feature_builder.py`.
+
+| Model | Validation | ROC-AUC | Macro-F1 | Precision | Recall |
+|---|---|---|---|---|---|
+| Landslide v4 (old) | spatial CV | 0.741 | 0.656 | 0.494 | 0.501 |
+| **Landslide susceptibility v5** | spatial CV, road-matched negatives | **0.882** | **0.752** | **0.614** | **0.676** |
+| IMD rainfall rule (old trigger) | same rows | 0.767 | 0.618 | 0.284 | 0.347 |
+| **Landslide trigger v5** | leave-one-year-out | **0.787** | **0.619** | 0.275 | **0.387** |
+| Flood, old features without S1 | spatial CV | 0.888 | 0.798 | 0.726 | 0.858 |
+| **Flood v5** | spatial CV | **0.886** | **0.834** | **0.767** | **0.884** |
+| **Flood v5** | leave-one-date-out | 0.862 | 0.821 | 0.752 | 0.874 |
 
 Without them, risk predictions return `0`.
 
