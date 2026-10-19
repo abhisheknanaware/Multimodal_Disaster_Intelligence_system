@@ -18,7 +18,8 @@ from sklearn.metrics import (roc_auc_score, average_precision_score, f1_score,
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(ROOT, 'python-ml-service'))
-from feature_builder import LANDSLIDE_FEATURES, FLOOD_FEATURES  # noqa: E402
+import feature_builder as fb  # noqa: E402
+from feature_builder import LANDSLIDE_FEATURES, FLOOD_FEATURES, TRIGGER_FEATURES  # noqa: E402
 
 DATA_DIR = os.path.join(ROOT, 'data', 'v5')
 MODEL_DIR = os.path.join(ROOT, 'models', 'v5')
@@ -141,6 +142,10 @@ def train_landslide():
     hard = (df.neg_type != 'random').values
     report['spatial_cv_hard_negatives_only'] = fold_metrics(y[hard], p[hard], t[hard])
 
+    no_road = [f for f in LANDSLIDE_FEATURES if f != 'dist_road_m']
+    p_nr, t_nr = oof_predict(df[no_road], y, groups, splitter, cfg)
+    report['ablation_without_road_distance'] = fold_metrics(y, p_nr, t_nr)
+
     old = old_landslide_scores(df)
     report['old_v4_same_points'] = metrics(y, old, best_threshold(y, old))
     report['old_v4_hard_negatives_only'] = metrics(y[hard], old[hard], best_threshold(y[hard], old[hard]))
@@ -175,7 +180,7 @@ def train_flood():
     base_cfg = select_config(X, y, groups)
     # More rain or wetter soil must never lower flood risk, including beyond the training range
     cfg = {**base_cfg, 'monotone_constraints': {f: 1 for f in FLOOD_FEATURES
-                                                if f.startswith('rain_') and f != 'rain_3d_share_14d'
+                                                if f.startswith('rain_')
                                                 or f == 'soil_moisture'}}
 
     splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
@@ -215,6 +220,43 @@ def train_flood():
     return report
 
 
+def trigger_matrix(df):
+    rows = []
+    for r in df.itertuples():
+        rain = {'24h_mm': r.rain_1d, '3d_mm': r.rain_3d, '7d_mm': r.rain_7d, '14d_mm': r.rain_14d,
+                '30d_mm': r.rain_30d, 'hours_24h': r.rain_hours_1d, 'max_daily_7d_mm': r.rain_max_1d_7d}
+        rows.append(fb.trigger_features(rain, r.soil_moisture, {'rain_clim_jjas': r.rain_clim_jjas}))
+    return pd.DataFrame(rows)[TRIGGER_FEATURES]
+
+
+def train_trigger():
+    print("\n=== LANDSLIDE RAINFALL TRIGGER ===")
+    df = pd.read_csv(os.path.join(DATA_DIR, 'landslide_trigger_v5.csv'))
+    X, y = trigger_matrix(df), df['label'].values
+    years = df.year.astype(str).values
+    mono = {f: 1 for f in TRIGGER_FEATURES if f not in ('rain_3d_share_14d', 'rain_clim_jjas')}
+    cfg = {'depth': 4, 'l2_leaf_reg': 5, 'learning_rate': 0.03, 'iterations': 600, 'monotone_constraints': mono}
+
+    p, t = oof_predict(X, y, years, LeaveOneGroupOut(), cfg, inner_groups=df.cell.values)
+    report = {'config': {k: v for k, v in cfg.items() if k != 'monotone_constraints'},
+              'n_events': int(y.sum()), 'n_controls': int((y == 0).sum()),
+              'events_by_source': df[df.label == 1].source.value_counts().to_dict(),
+              'leave_one_year_out_cv': fold_metrics(y, p, t)}
+
+    rule = np.array([fb.landslide_rain_trigger(a, b) for a, b in zip(df.rain_1d, df.rain_3d)])
+    report['old_imd_rule_same_rows'] = metrics(y, rule, best_threshold(y, rule))
+
+    final = make_model(cfg).fit(X, y)
+    final.save_model(os.path.join(MODEL_DIR, 'landslide_trigger_v5.cbm'))
+    report['deploy_threshold'] = float(np.median(t))
+    # Case-control sampling (1:10) makes raw scores relative; 1.0 = a typical intense landslide day
+    report['trigger_scale'] = float(np.percentile(final.predict_proba(X[y == 1])[:, 1], 90))
+    report['features'] = TRIGGER_FEATURES
+    report['feature_importance'] = dict(sorted(
+        zip(TRIGGER_FEATURES, map(float, final.get_feature_importance())), key=lambda kv: -kv[1]))
+    return report
+
+
 if __name__ == '__main__':
     which = sys.argv[1] if len(sys.argv) > 1 else 'all'
     out_path = os.path.join(MODEL_DIR, 'metrics_v5.json')
@@ -223,6 +265,8 @@ if __name__ == '__main__':
         results['landslide'] = train_landslide()
     if which in ('all', 'flood'):
         results['flood'] = train_flood()
+    if which in ('all', 'trigger'):
+        results['landslide_trigger'] = train_trigger()
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(json.dumps({k: {kk: vv for kk, vv in v.items() if kk not in ('feature_importance', 'features')}

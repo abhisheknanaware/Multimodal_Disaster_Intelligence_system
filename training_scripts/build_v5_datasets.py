@@ -56,6 +56,49 @@ def hard_negatives(pos_utm, assam, n):
     return pd.DataFrame(out, columns=['latitude', 'longitude'])
 
 
+def near_road_negatives(pos_utm, assam, n):
+    """Hilly points 0-600 m from a road, 1-20 km from any mapped slide."""
+    tree = cKDTree(pos_utm)
+    roads = np.load(fb.ROADS_PATH)['xy_utm46']
+    lo, hi = pos_utm.min(0) - 20000, pos_utm.max(0) + 20000
+    roads = roads[(roads[:, 0] > lo[0]) & (roads[:, 0] < hi[0]) & (roads[:, 1] > lo[1]) & (roads[:, 1] < hi[1])]
+    out = []
+    while len(out) < n:
+        base = roads[rng.integers(0, len(roads), 4000)]
+        ang, r = rng.uniform(0, 2 * np.pi, 4000), rng.uniform(0, 600, 4000)
+        cand = base + np.column_stack([r * np.cos(ang), r * np.sin(ang)])
+        d, _ = tree.query(cand)
+        cand = cand[(d > 1000) & (d < 20000)]
+        pts = gpd.GeoSeries([Point(x, y) for x, y in cand], crs=32646).to_crs(4326)
+        pts = pts[pts.within(assam)]
+        for p in pts:
+            if fb._point(fb._open(fb.SLOPE_PATH), p.x, p.y) >= 8:
+                out.append((p.y, p.x))
+            if len(out) >= n:
+                break
+    return pd.DataFrame(out, columns=['latitude', 'longitude'])
+
+
+def road_matched(cands, pos, n):
+    """
+    The inventory was surveyed along roads, so slides sit close to them. Sample hard
+    negatives with the same distance-to-road profile so the model cannot learn survey bias.
+    """
+    bins = [0, 100, 250, 500, 1000, 2000, 5000, np.inf]
+    d_pos = np.array([fb.distance_to_road(a, b) for a, b in zip(pos.latitude, pos.longitude)])
+    d_neg = np.array([fb.distance_to_road(a, b) for a, b in zip(cands.latitude, cands.longitude)])
+    want = np.histogram(d_pos, bins)[0] / len(d_pos) * n
+    b_neg = np.digitize(d_neg, bins) - 1
+    picked = []
+    for k, w in enumerate(want):
+        idx = np.flatnonzero(b_neg == k)
+        take = min(len(idx), int(round(w)))
+        picked.extend(rng.choice(idx, take, replace=False))
+        if take < round(w):
+            print(f"  road bin {bins[k]}-{bins[k + 1]} m: only {take}/{int(round(w))} candidates")
+    return cands.iloc[sorted(picked)].reset_index(drop=True)
+
+
 def build_landslide():
     print("Building landslide dataset...")
     pos = gpd.read_file(os.path.join(ROOT, 'Processing', 'assam_landslides_utm46.gpkg'))
@@ -71,7 +114,9 @@ def build_landslide():
                             'district': None, 'class': 0, 'neg_type': 'random'})
 
     assam = gpd.read_file(os.path.join(ROOT, 'Processing', 'assam_background_area.gpkg')).to_crs(4326).geometry.iloc[0]
-    df_hard = hard_negatives(pos_utm, assam, 1200)
+    cands = pd.concat([hard_negatives(pos_utm, assam, 4000), near_road_negatives(pos_utm, assam, 4000)],
+                      ignore_index=True)
+    df_hard = road_matched(cands, df_pos, 1200)
     df_hard['district'] = None
     df_hard['class'] = 0
     df_hard['neg_type'] = 'hard'

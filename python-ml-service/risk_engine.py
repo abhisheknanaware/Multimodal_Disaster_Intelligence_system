@@ -31,6 +31,7 @@ def _load(name):
 
 landslide_model = _load("landslide_v5.cbm")
 flood_model = _load("flood_v5.cbm")
+trigger_model = _load("landslide_trigger_v5.cbm")
 
 try:
     with open(os.path.join(MODEL_DIR, "metrics_v5.json")) as f:
@@ -39,6 +40,7 @@ except Exception:
     _metrics = {}
 LANDSLIDE_THRESHOLD = _metrics.get("landslide", {}).get("deploy_threshold", 0.5)
 FLOOD_THRESHOLD = _metrics.get("flood", {}).get("deploy_threshold", 0.5)
+TRIGGER_SCALE = _metrics.get("landslide_trigger", {}).get("trigger_scale", 1.0)
 
 
 @lru_cache(maxsize=4096)
@@ -60,11 +62,22 @@ def _predict(model, features: list, values: dict):
     return prob, local, global_fi
 
 
-def calculate_dynamic_risk(lat: float, lon: float, rainfall: dict) -> dict:
+def rain_trigger(lat: float, lon: float, rainfall: dict, soil_moisture=None):
     """
-    Landslide hazard = learned susceptibility (v5 classifier on terrain) x rainfall trigger.
-    `rainfall` holds 24h_mm and 3d_mm ending at the time being predicted, so callers can
-    shift it forward with forecast rain for the 24h / 72h horizons.
+    Learned rainfall trigger in [0, 1] (1 = as wet as a typical intense landslide day),
+    from dated GSI + NASA GLC events. Falls back to the IMD-threshold rule without the model.
+    """
+    if trigger_model is None:
+        return fb.landslide_rain_trigger(rainfall.get("24h_mm", 0), rainfall.get("3d_mm", 0)), None
+    values = fb.trigger_features(rainfall, soil_moisture, fb.rain_climatology(lat, lon))
+    raw, local, _ = _predict(trigger_model, fb.TRIGGER_FEATURES, values)
+    return round(min(1.0, raw / TRIGGER_SCALE), 4), local
+
+
+def calculate_dynamic_risk(lat: float, lon: float, rainfall: dict, soil_moisture=None) -> dict:
+    """
+    Landslide hazard = learned susceptibility (terrain classifier) x learned rainfall trigger.
+    `rainfall` holds the windows ending at the time being predicted (now or a forecast horizon).
     """
     result = {"probability": 0.0, "susceptibility": None, "rainTrigger": None,
               "localContributions": None, "globalFeatureImportance": None}
@@ -73,12 +86,13 @@ def calculate_dynamic_risk(lat: float, lon: float, rainfall: dict) -> dict:
     try:
         terrain = terrain_at(lat, lon)
         susceptibility, local, global_fi = _predict(landslide_model, fb.LANDSLIDE_FEATURES, terrain)
-        trigger = fb.landslide_rain_trigger(rainfall.get("24h_mm", 0), rainfall.get("3d_mm", 0))
+        trigger, trigger_local = rain_trigger(lat, lon, rainfall, soil_moisture)
         result.update({
             "probability": round(susceptibility * trigger, 4),
             "susceptibility": round(susceptibility, 4),
             "susceptibleClass": susceptibility >= LANDSLIDE_THRESHOLD,
             "rainTrigger": trigger,
+            "triggerContributions": trigger_local,
             "localContributions": local,
             "globalFeatureImportance": global_fi,
         })
