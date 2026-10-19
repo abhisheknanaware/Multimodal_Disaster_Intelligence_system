@@ -82,6 +82,8 @@ async def get_risk(latitude: float = Query(..., description="Latitude"),
     else:
         # Map metric value to 'change' for /risk consistency as requested
         sar_data["change"] = sar_data["value"]
+        
+    terrain_data['sar_change'] = sar_data.get("change")
     
     t_raster_end = time.perf_counter()
     raster_ms = round((t_raster_end - t_raster_start) * 1000, 2)
@@ -106,33 +108,22 @@ async def get_risk(latitude: float = Query(..., description="Latitude"),
         from s2_service import get_s2_at_location
         s2_data = get_s2_at_location(latitude, longitude)
         
-        current_risk_data = calculate_dynamic_risk(terrain_data, rainfall, forecast, s2_data)
+        current_risk_data = calculate_dynamic_risk(latitude, longitude, rainfall)
         current_risk = current_risk_data.get("probability", 0.0)
-        
-        risk_24h = calculate_dynamic_risk(terrain_data, 
-            {"24h_mm": forecast["24h_mm"], "3d_mm": rainfall["3d_mm"]+forecast["24h_mm"], "7d_mm": rainfall["7d_mm"]+forecast["24h_mm"], "14d_mm": rainfall["14d_mm"], "30d_mm": rainfall["30d_mm"]}, 
-            forecast, s2_data).get("probability", 0.0)
-            
-        risk_72h = calculate_dynamic_risk(terrain_data, 
-            {"24h_mm": forecast["72h_mm"]/3.0, "3d_mm": forecast["72h_mm"], "7d_mm": rainfall["7d_mm"]+forecast["72h_mm"], "14d_mm": rainfall["14d_mm"], "30d_mm": rainfall["30d_mm"]}, 
-            forecast, s2_data).get("probability", 0.0)
-            
+
+        # Shift the rainfall windows forward with forecast rain for the 24h / 72h horizons
+        risk_24h = calculate_dynamic_risk(latitude, longitude,
+            {"24h_mm": forecast["24h_mm"], "3d_mm": rainfall["3d_mm"] * 2 / 3 + forecast["24h_mm"]}).get("probability", 0.0)
+        risk_72h = calculate_dynamic_risk(latitude, longitude,
+            {"24h_mm": forecast["72h_mm"] / 3.0, "3d_mm": forecast["72h_mm"]}).get("probability", 0.0)
+
         risk_class = get_risk_class(current_risk)
-        
-        # Calculate heuristic feature importance for Landslide 
-        r_score = (rainfall.get("24h_mm", 0)*1.0 + rainfall.get("3d_mm", 0)*0.8 + rainfall.get("7d_mm", 0)*0.5)
-        base_w = 1.0
-        rain_w = min(1.5, r_score / 150.0)
-        slope_w = 0.2 if slope_val and slope_val > 20 else 0.05
-        s1_w = 0.1 if sar_data.get("change") is not None else 0.0
-        
-        localContributions = current_risk_data.get("localContributions")
-        globalFeatureImportance = current_risk_data.get("globalFeatureImportance")
+
         riskFactorWeighting = {
-            "baseline_susceptibility": 0.0, # Not used in true ML model
-            "rainfall": round(rainfall.get("24h_mm", 0) / 300.0, 3), # Heuristic proxy for UI 
+            "baseline_susceptibility": current_risk_data.get("susceptibility"),
+            "rainfall": current_risk_data.get("rainTrigger"),
             "slope": round(slope_val / 90.0, 3) if slope_val else 0,
-            "sentinel1": round(abs(sar_data.get('vh_change', 0)) / 10.0, 3) if sar_data else 0
+            "sentinel1": 0.0
         }
         
         # Calculate flood risk concurrently or sequentially
@@ -154,8 +145,8 @@ async def get_risk(latitude: float = Query(..., description="Latitude"),
     return {
         "status": "ok",
         "metadata": {
-            "model_version": "v3_xgb_advanced",
-            "feature_version": "v3_engineered",
+            "model_version": "v5_catboost",
+            "feature_version": "v5_shared_feature_builder",
             "sentinel2_available": s2_data.get("available", False),
             "sentinel1_available": sar_data.get("available", False) if sar_data else False,
             "rainfall_source": "Open-Meteo"
@@ -297,12 +288,8 @@ async def debug_landslide(lat: float, lng: float):
         
     # Genuine ML calculation
     import risk_engine
-    if hasattr(risk_engine, 'ls_feature_names'):
-        features_list = risk_engine.ls_feature_names
-    else:
-        features_list = ['dem', 'slope', 'aspect', 'tri', 'tpi', 'rainfall']
-        
-    dynamic_risk_data = calculate_dynamic_risk(terrain_data, rain, weather.get("forecast", {}))
+    features_list = risk_engine.fb.LANDSLIDE_FEATURES
+    dynamic_risk_data = calculate_dynamic_risk(lat, lng, rain)
     dynamic_risk = dynamic_risk_data.get("probability", 0.0)
     
     return {
@@ -311,8 +298,8 @@ async def debug_landslide(lat: float, lng: float):
             "longitude": lng
         },
         "model": {
-            "name": "CatBoost Classifier (v3)",
-            "version": "3.0",
+            "name": "CatBoost Classifier (v5) x rainfall trigger",
+            "version": "5.0",
             "features": features_list
         },
         "features": {
@@ -344,8 +331,8 @@ async def debug_flood(lat: float, lng: float):
             },
             "model": {
                 "name": "CatBoost Classifier",
-                "version": "v1",
-                "features": ['rain_intensity', 'rainfall_1d', 'rainfall_3d', 'rainfall_7d', 'antecedent_rainfall', 'DEM', 'slope', 'S1_VV', 'S1_VH', 'S1_VV_change', 'S1_VH_change', 'S1_VV_VH_ratio']
+                "version": "v5",
+                "features": risk_engine.fb.FLOOD_FEATURES
             },
             "features": {
                 "terrain": flood_data.get("terrain", {}),
@@ -357,7 +344,7 @@ async def debug_flood(lat: float, lng: float):
                 "riskLevel": risk_level
             },
             "metadata": {
-                "pipeline": "MODEL-DRIVEN / BROKEN PIPELINE (Inverted Feature Response, Label Leakage)"
+                "pipeline": "MODEL-DRIVEN / GENUINE ML INFERENCE"
             }
         }
     except Exception as e:

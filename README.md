@@ -92,12 +92,23 @@ Place them at these exact paths:
 | `sentel/sentinel/output/2026/S1A_IW_GRDH_..._TC.dim` + `.data/` folder | ~5 GB |
 | `data/sentinel2/2025/processed/*.tif` | ~3 GB |
 
-### 2. Trained v3 models (~0.5 MB)
+### 2. Trained models
 
-The ML service loads these from `D:\models_v3\`:
+The ML service loads v5 models from `models/v5/` (override with `MODEL_DIR`):
 
-- `landslide_catboost_v3.cbm`
-- `flood_catboost_v3.cbm`
+- `landslide_v5.cbm` — terrain susceptibility classifier; live risk = susceptibility × rainfall trigger (IMD heavy-rain classes)
+- `flood_v5.cbm` — live Open-Meteo rainfall + soil moisture + terrain/floodplain features, monotonic in rainfall
+- `imd_monsoon_climatology.npz` — IMD 2020–2025 Jun–Sep rainfall climatology used as a feature
+- `metrics_v5.json` — spatial / temporal cross-validation metrics and decision thresholds
+
+Rebuild with `python training_scripts/build_v5_datasets.py` then `python training_scripts/train_v5_models.py`. Features for training and serving come from the same module, `python-ml-service/feature_builder.py`.
+
+| Model (spatial CV) | ROC-AUC | Macro-F1 | Precision | Recall |
+|---|---|---|---|---|
+| Landslide v4 (old) | 0.712 | 0.633 | 0.449 | 0.501 |
+| **Landslide v5** | **0.845** | **0.729** | **0.557** | **0.703** |
+| Flood, old features without S1 | 0.891 | 0.807 | 0.733 | 0.871 |
+| **Flood v5** | **0.888** | **0.813** | **0.726** | **0.911** |
 
 Without them, risk predictions return `0`.
 

@@ -20,3 +20,6 @@ coverage/
 *.SAFE/
 *.zip
 uploads/
+
+# Open-Meteo archive cache used by training_scripts/build_v5_datasets.py
+data/v5/cache/
